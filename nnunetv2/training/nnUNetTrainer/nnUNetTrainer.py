@@ -1,6 +1,7 @@
 import inspect
 import multiprocessing
 import os
+import yaml
 import shutil
 import sys
 import warnings
@@ -8,18 +9,10 @@ from copy import deepcopy
 from datetime import datetime
 from time import time, sleep
 from typing import Tuple, Union, List
+from nnunetv2.training.nnUNetTrainer.WandbWrapper import WandbWrapper
 
-import yaml
-import wandb
 import numpy as np
 import torch
-from torch import autocast, nn
-from torch import distributed as dist
-from torch._dynamo import OptimizedModule
-from torch.cuda import device_count
-from torch.cuda.amp import GradScaler
-from torch.nn.parallel import DistributedDataParallel as DDP
-
 from batchgenerators.dataloading.multi_threaded_augmenter import MultiThreadedAugmenter
 from batchgenerators.dataloading.nondet_multi_threaded_augmenter import NonDetMultiThreadedAugmenter
 from batchgenerators.dataloading.single_threaded_augmenter import SingleThreadedAugmenter
@@ -45,6 +38,12 @@ from batchgeneratorsv2.transforms.utils.pseudo2d import Convert3DTo2DTransform, 
 from batchgeneratorsv2.transforms.utils.random import RandomTransform
 from batchgeneratorsv2.transforms.utils.remove_label import RemoveLabelTansform
 from batchgeneratorsv2.transforms.utils.seg_to_regions import ConvertSegmentationToRegionsTransform
+from torch import autocast, nn
+from torch import distributed as dist
+from torch._dynamo import OptimizedModule
+from torch.cuda import device_count
+from torch.cuda.amp import GradScaler
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from nnunetv2.configuration import ANISO_THRESHOLD, default_num_processes
 from nnunetv2.evaluation.evaluate_predictions import compute_metrics_on_folder
@@ -198,6 +197,8 @@ class nnUNetTrainer(object):
 
         # Hyperparameters initialization
         yaml_config = yaml.safe_load(open("nnunetv2/training/nnUNetTrainer/config.yaml"))
+        yaml_config['architecture'] = configuration
+        yaml_config['fold'] = fold
         self.num_epochs = yaml_config['num_epochs']
         self.initial_lr = yaml_config['initial_lr']
         self.weight_decay = yaml_config['weight_decay']
@@ -207,17 +208,9 @@ class nnUNetTrainer(object):
         self.enable_deep_supervision = yaml_config['enable_deep_supervision']
         self.current_epoch = 0  ## Dynamic variable not stored in yaml config
 
-        # wandb initialization
-        nnow = datetime.now()
-        ndate_str = nnow.strftime("%Y.%m.%d")
-        ntime_str = nnow.strftime("%H:%M:%S")
-
-        hyperparameter_defaults = dict(architecture=f"nnUNet - {configuration}")
-        wandb_config = dict(yaml=yaml_config, params=hyperparameter_defaults)
-
-        wandb_mode = 'online' if yaml_config["wandb_enabled"] == 1 else 'disabled'
-        wandb_name = f"{yaml_config['project_name']}_{configuration}_fold_{fold}_{ndate_str}_{ntime_str}"
-        wandb.init(project=yaml_config['project_name'], mode=wandb_mode, name=wandb_name, config=wandb_config)
+        # WandbWrapper initialization
+        self.wandb = WandbWrapper(use_wandb=yaml_config['wandb_enabled'], config=yaml_config)
+        self.wandb.init()
 
     def initialize(self):
         if not self.was_initialized:
@@ -981,7 +974,7 @@ class nnUNetTrainer(object):
 
         empty_cache(self.device)
         self.print_to_log_file("Training done.")
-        wandb.finish()
+        self.wandb.finish()
 
     def on_train_epoch_start(self):
         self.network.train()
@@ -1024,7 +1017,7 @@ class nnUNetTrainer(object):
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
 
-        wandb.log({"training_loss_per_it": l.detach().cpu().numpy()})
+        self.wandb.log({"training_loss_per_it": l.detach().cpu().numpy()})
         return {'loss': l.detach().cpu().numpy()}
 
     def on_train_epoch_end(self, train_outputs: List[dict]):
@@ -1153,10 +1146,10 @@ class nnUNetTrainer(object):
         self.print_to_log_file('Pseudo dice', [np.round(i, decimals=4) for i in
                                                self.logger.my_fantastic_logging['dice_per_class_or_region'][-1]])
         
-        wandb.log({"epoch": self.current_epoch, "val_loss": self.logger.my_fantastic_logging['val_losses'][-1],"training_loss": self.logger.my_fantastic_logging['train_losses'][-1], "lr": self.optimizer.param_groups[0]['lr']})
+        self.wandb.log({"epoch": self.current_epoch, "val_loss": self.logger.my_fantastic_logging['val_losses'][-1],"training_loss": self.logger.my_fantastic_logging['train_losses'][-1], "lr": self.optimizer.param_groups[0]['lr']})
         all_dice = [np.round(i, decimals=4) for i in self.logger.my_fantastic_logging['dice_per_class_or_region'][-1]]
         dice_val = np.average(all_dice) # exclude background in the average dice
-        wandb.log({"Average Dice": np.round(dice_val, decimals=4)})
+        self.wandb.log({"Average Dice": np.round(dice_val, decimals=4)})
 
         for label_name, label_idx in self.dataset_json['labels'].items():
             # Skip the 'background' or any label with index 0
@@ -1166,8 +1159,7 @@ class nnUNetTrainer(object):
             all_dice_idx = label_idx - 1
             if 0 <= all_dice_idx < len(all_dice):
                 dice_score = np.round(all_dice[all_dice_idx], decimals=4)
-                # print(f"{label_name} Dice: {dice_score}")
-                wandb.log({f"{label_name} Dice": dice_score})
+                self.wandb.log({f"{label_name} Dice": dice_score})
 
         self.print_to_log_file(
             f"Epoch time: {np.round(self.logger.my_fantastic_logging['epoch_end_timestamps'][-1] - self.logger.my_fantastic_logging['epoch_start_timestamps'][-1], decimals=2)} s")
@@ -1182,7 +1174,7 @@ class nnUNetTrainer(object):
             self._best_ema = self.logger.my_fantastic_logging['ema_fg_dice'][-1]
             self.print_to_log_file(f"Yayy! New best EMA pseudo Dice: {np.round(self._best_ema, decimals=4)}")
             self.save_checkpoint(join(self.output_folder, 'checkpoint_best.pth'))
-            wandb.log({"best EMA pseudo Dice": np.round(self._best_ema, decimals=4)})
+            self.wandb.log({"best EMA pseudo Dice": np.round(self._best_ema, decimals=4)})
             
         if self.local_rank == 0:
             self.logger.plot_progress_png(self.output_folder)

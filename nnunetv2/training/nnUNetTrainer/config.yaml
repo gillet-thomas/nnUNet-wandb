@@ -1,4 +1,4 @@
-project_name: ASC
+project_name: Amos 22 Dataset
 dataset: amos2022
 wandb_enabled: 1
 
